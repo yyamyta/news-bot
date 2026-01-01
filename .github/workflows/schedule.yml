@@ -1,0 +1,29 @@
+name: News Bot Schedule
+
+on:
+  schedule:
+    - cron: "0 23 * * *" # 毎日 8:00 JST (GitHub は UTC 間隔)
+  workflow_dispatch: # 手動実行用
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.x"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run bot
+        run: python main.py
+        env:
+          LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
+          LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
