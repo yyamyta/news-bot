@@ -1,8 +1,9 @@
 import os
 import time
+import re
 import requests
 import feedparser
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 from datetime import datetime, timezone, timedelta
 
 # =========================
@@ -109,8 +110,10 @@ def is_recent(published_dt: datetime) -> bool:
 
 def resolve_final_url(url: str) -> str:
     """
-    Google NewsのリダイレクトURLを元記事URLに解決（生存確認も兼ねる）
-    失敗したら空文字を返す。
+    Google News RSSの /rss/articles/... を元記事URLに解決する。
+    - 302リダイレクトで取れるならそれを採用
+    - 取れない場合はHTMLから元URLを抽出
+    - それでもダメなら空文字
     """
     try:
         r = requests.get(
@@ -121,10 +124,35 @@ def resolve_final_url(url: str) -> str:
         )
         if r.status_code >= 400:
             return ""
-        # たまにGoogleの同意画面に飛ぶことがあるので、その場合は元のURLを返す
-        if "consent.google.com" in (r.url or ""):
-            return url
-        return r.url or url
+
+        final = (r.url or "").strip()
+
+        # すでに元記事に飛べていればOK
+        if final.startswith("http") and "news.google.com/rss/articles/" not in final:
+            if "consent.google.com" in final:
+                return ""
+            return final
+
+        # まだGoogleのRSSリンクのままなら、HTMLから元記事URLを抜く
+        html = r.text or ""
+
+        # よくある形：https://www.google.com/url?...&url=<encoded>&...
+        m = re.search(r'https?://www\.google\.com/url\?[^"\']+', html)
+        if m:
+            u = m.group(0)
+            m2 = re.search(r'url=([^&]+)', u)
+            if m2:
+                candidate = unquote(m2.group(1))
+                if candidate.startswith("http") and "google.com" not in candidate and "news.google.com" not in candidate:
+                    return candidate
+
+        # 別パターン：HTML内に url=<encoded> が埋まっている
+        for m3 in re.finditer(r'url=([^&"\']+)', html):
+            candidate = unquote(m3.group(1))
+            if candidate.startswith("http") and "google.com" not in candidate and "news.google.com" not in candidate:
+                return candidate
+
+        return ""
     except Exception:
         return ""
 
@@ -170,6 +198,10 @@ def main():
                 # URLを元記事に解決（死んでる/飛べない率を下げる）
                 final_url = resolve_final_url(raw_link)
                 if not final_url:
+                    continue
+
+                # GoogleニュースRSSのまま残るリンクは壊れやすいので送らない
+                if "news.google.com/rss/articles/" in final_url:
                     continue
 
                 if final_url in seen:
