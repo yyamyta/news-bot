@@ -3,7 +3,14 @@ import time
 import requests
 import feedparser
 from urllib.parse import quote_plus
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+
+# =========================
+# 直近N日だけ送る
+# =========================
+RECENT_DAYS = 3
+REQUEST_TIMEOUT = 20
+USER_AGENT = "Mozilla/5.0 (NewsBot/1.0)"
 
 # =========================
 # キーワード設計（あなた向け）
@@ -26,8 +33,7 @@ INDUSTRY_TERMS = [
     "省エネ", "ZEB", "脱炭素"
 ]
 
-MAX_ARTICLES = 12
-REQUEST_TIMEOUT = 20
+MAX_ARTICLES = 12  # 1回に送る最大件数
 
 # =========================
 # 取得元（指定5サイト）
@@ -37,7 +43,6 @@ REQUEST_TIMEOUT = 20
 def google_news_rss(query: str) -> str:
     return f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=ja&gl=JP&ceid=JP:ja"
 
-# 「サイト縛り + 施工管理/設備管理っぽい語」くらいにして、取り逃しを減らす
 SITE_FEEDS = [
     ("日経クロステック", [
         google_news_rss("site:xtech.nikkei.com 施工管理"),
@@ -46,11 +51,13 @@ SITE_FEEDS = [
     ]),
     ("ダイヤモンド・オンライン", [
         google_news_rss("site:diamond.jp 施工管理"),
+        google_news_rss("site:diamond.jp 設備管理"),
         google_news_rss("site:diamond.jp 建設 採用"),
     ]),
     ("NewsPicks", [
-        google_news_rss("site:newspicks.com 建設 採用"),
         google_news_rss("site:newspicks.com 施工管理"),
+        google_news_rss("site:newspicks.com 設備管理"),
+        google_news_rss("site:newspicks.com 建設 採用"),
     ]),
 ]
 
@@ -62,7 +69,7 @@ DIRECT_FEEDS = [
 SOURCES = DIRECT_FEEDS + SITE_FEEDS
 
 # =========================
-# LINE送信
+# LINE送信（Secrets）
 # =========================
 LINE_TOKEN = os.getenv("LINE_CHANNEL_TOKEN")
 LINE_TO = os.getenv("LINE_TO_USER_ID")
@@ -92,8 +99,34 @@ def count_hit(words, text: str) -> int:
 def get_published_dt(entry) -> datetime:
     t = getattr(entry, "published_parsed", None) or getattr(entry, "updated_parsed", None)
     if not t:
+        # 日付が取れないものは古い扱い（直近だけにしたいので）
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
     return datetime(*t[:6], tzinfo=timezone.utc)
+
+def is_recent(published_dt: datetime) -> bool:
+    now = datetime.now(timezone.utc)
+    return published_dt >= (now - timedelta(days=RECENT_DAYS))
+
+def resolve_final_url(url: str) -> str:
+    """
+    Google NewsのリダイレクトURLを元記事URLに解決（生存確認も兼ねる）
+    失敗したら空文字を返す。
+    """
+    try:
+        r = requests.get(
+            url,
+            allow_redirects=True,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": USER_AGENT},
+        )
+        if r.status_code >= 400:
+            return ""
+        # たまにGoogleの同意画面に飛ぶことがあるので、その場合は元のURLを返す
+        if "consent.google.com" in (r.url or ""):
+            return url
+        return r.url or url
+    except Exception:
+        return ""
 
 def split_for_line(message: str, limit: int = 4500):
     chunks, buf = [], ""
@@ -112,7 +145,7 @@ def split_for_line(message: str, limit: int = 4500):
     return chunks
 
 # =========================
-# メイン（2カテゴリ）
+# メイン（2カテゴリで送る）
 # =========================
 def main():
     items = []
@@ -121,12 +154,25 @@ def main():
     for source_name, feed_urls in SOURCES:
         for feed_url in feed_urls:
             feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:40]:
+
+            for entry in feed.entries[:50]:
                 title = norm(entry.get("title", ""))
-                link = entry.get("link", "")
+                raw_link = entry.get("link", "")
                 summary = norm(entry.get("summary", "") or entry.get("description", ""))
 
-                if not link or link in seen:
+                if not raw_link:
+                    continue
+
+                published = get_published_dt(entry)
+                if not is_recent(published):
+                    continue
+
+                # URLを元記事に解決（死んでる/飛べない率を下げる）
+                final_url = resolve_final_url(raw_link)
+                if not final_url:
+                    continue
+
+                if final_url in seen:
                     continue
 
                 text = f"{title} {summary}"
@@ -135,28 +181,26 @@ def main():
                 cand_score = count_hit(CANDIDATE_TERMS, text)
                 ind_score = count_hit(INDUSTRY_TERMS, text)
 
-                # 建設・設備の文脈が薄いものは落とす（ノイズ対策）
+                # 建設/設備の文脈が薄いものは落とす（ノイズ対策）
                 if role_score == 0 and ind_score == 0:
                     continue
-
-                published = get_published_dt(entry)
 
                 items.append({
                     "source": source_name,
                     "title": title,
-                    "link": link,
+                    "link": final_url,
                     "summary": summary,
                     "published": published,
                     "role_score": role_score,
                     "cand_score": cand_score,
                     "ind_score": ind_score,
                 })
-                seen.add(link)
+                seen.add(final_url)
 
             time.sleep(0.2)
 
     if not items:
-        push_line("✅ 今日の該当ニュースはありませんでした（建設/設備文脈のヒットなし）")
+        push_line(f"✅ 直近{RECENT_DAYS}日で該当ニュースはありませんでした（建設/設備文脈のヒットなし）")
         return
 
     # A) 求職者向け：転職・待遇系を強く評価
@@ -176,10 +220,10 @@ def main():
     cand_top = [x for x in cand_items if x["cand_score"] > 0][:6]
     ind_top  = [x for x in ind_items if x["ind_score"] > 0][:6]
 
-    # どっちも空になりうるので保険（役割語で拾えたものを最低限送る）
+    # 保険：どっちも空なら、役割語で拾えたものを送る
     if not cand_top and not ind_top:
         fallback = sorted(items, key=lambda x: (x["role_score"], x["published"]), reverse=True)[:6]
-        msg = "📰 今日の建設/設備ニュース（参考）\n"
+        msg = f"📰 直近{RECENT_DAYS}日：建設/設備ニュース（参考）\n"
         for it in fallback:
             summ = it["summary"][:220] + ("…" if len(it["summary"]) > 220 else "")
             msg += f"\n\n{it['title']}\n要旨：{summ}\nURL：{it['link']}\n"
@@ -187,17 +231,17 @@ def main():
             push_line(chunk); time.sleep(0.5)
         return
 
-    lines = ["🧑‍💼 求職者向け（転職・待遇・働き方）"]
+    lines = [f"🧑‍💼 直近{RECENT_DAYS}日：求職者向け（転職・待遇・働き方）"]
     for it in cand_top:
         summ = it["summary"][:220] + ("…" if len(it["summary"]) > 220 else "")
         lines.append(f"\n\n{it['title']}\n要旨：{summ}\nURL：{it['link']}")
 
-    lines.append("\n🏗️ 業界理解（制度・市場・DX・省エネ）")
+    lines.append(f"\n🏗️ 直近{RECENT_DAYS}日：業界理解（制度・市場・DX・省エネ）")
     for it in ind_top:
         summ = it["summary"][:220] + ("…" if len(it["summary"]) > 220 else "")
         lines.append(f"\n\n{it['title']}\n要旨：{summ}\nURL：{it['link']}")
 
-    msg = "\n".join(lines)[:18000]  # 念のため暴走防止
+    msg = "\n".join(lines)[:18000]  # 暴走防止
     for chunk in split_for_line(msg):
         push_line(chunk)
         time.sleep(0.5)
