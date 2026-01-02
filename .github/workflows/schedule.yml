@@ -28,4 +28,3 @@ jobs:
         env:
           LINE_CHANNEL_TOKEN: ${{ secrets.LINE_CHANNEL_TOKEN }}
           LINE_TO_USER_ID: ${{ secrets.LINE_TO_USER_ID }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
